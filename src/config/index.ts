@@ -9,6 +9,7 @@ import type {
   ExtendedTelegramBotConfig,
   VerbosityLevel,
   NotificationPreferences,
+  ReportingConfig,
   LogLevel,
   StreamingConfig,
   StreamingMode,
@@ -71,8 +72,6 @@ export function getTelegramBotConfig(): TelegramBotConfig {
   const allowedUserIdsStr = requireEnv('ALLOWED_USER_IDS');
   const streamingConfig = buildStreamingConfig();
   const threadedModeConfig = buildThreadedModeConfig();
-  console.log('streamingConfig', streamingConfig);
-  console.log('threadedConfig', threadedModeConfig);
   return {
     token,
     streamingConfig,
@@ -199,6 +198,23 @@ export function getFileUploadConfig(): FileUploadConfig {
 }
 
 /**
+ * Get run reporting configuration from environment
+ */
+export function getReportingConfig(): ReportingConfig {
+  return {
+    enabled: parseBool(process.env['RUN_REPORTS_ENABLED'], true),
+    autoSend: parseBool(process.env['RUN_REPORTS_AUTOSEND'], true),
+    babysitterOnly: parseBool(process.env['RUN_REPORTS_BABYSITTER_ONLY'], true),
+    maxRunsPerSession: parseNumber(process.env['RUN_REPORTS_MAX_RUNS'], 25),
+    maxOutputChars: parseNumber(process.env['RUN_REPORTS_MAX_OUTPUT_CHARS'], 12000),
+    maxEvents: parseNumber(process.env['RUN_REPORTS_MAX_EVENTS'], 200),
+    maxToolInputChars: parseNumber(process.env['RUN_REPORTS_MAX_TOOL_INPUT_CHARS'], 2000),
+    maxFileSizeMB: parseNumber(process.env['RUN_REPORTS_MAX_FILE_MB'], 45),
+    previewDir: process.env['RUN_REPORTS_PREVIEW_DIR'],
+  };
+}
+
+/**
  * Get extended TelegramBot configuration from environment
  */
 export function getExtendedTelegramBotConfig(): ExtendedTelegramBotConfig {
@@ -210,6 +226,7 @@ export function getExtendedTelegramBotConfig(): ExtendedTelegramBotConfig {
     notificationConfig: getNotificationConfig(),
     verbosityConfig: getVerbosityConfig(),
     fileUploadConfig: getFileUploadConfig(),
+    reportingConfig: getReportingConfig(),
     logLevel: getLogLevel(),
   };
 }

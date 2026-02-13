@@ -7,7 +7,7 @@
  * 🧙 100% Built using Babysitter by a5c.ai
  */
 
-import { getTelegramBotConfig, getLogLevel } from './config/index.js';
+import { getExtendedTelegramBotConfig, getLogLevel } from './config/index.js';
 import { TelegramBot } from './bot/TelegramBot.js';
 
 async function main(): Promise<void> {
@@ -15,7 +15,7 @@ async function main(): Promise<void> {
   console.log(`[${new Date().toISOString()}] Starting Claude Code Telegram Bot (log level: ${logLevel})`);
 
   try {
-    const config = getTelegramBotConfig();
+    const config = getExtendedTelegramBotConfig();
     console.log(`[${new Date().toISOString()}] Loaded configuration`);
     console.log(`[${new Date().toISOString()}] Allowed users: ${config.allowedUserIds.join(', ')}`);
 

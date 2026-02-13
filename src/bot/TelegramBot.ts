@@ -2,6 +2,7 @@ import { Telegraf, Context } from 'telegraf';
 import type { Update, Message } from 'telegraf/types';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import type {
@@ -21,6 +22,7 @@ import type {
   ThreadedModeConfig,
   StreamingTelegramBotConfig,
   SessionContext,
+  ReportingConfig,
 } from '../types/index.js';
 import { SessionManager } from '../session/SessionManager.js';
 import { OutputParser } from '../parser/OutputParser.js';
@@ -29,6 +31,8 @@ import { NotificationManager } from '../notifications/index.js';
 import { StreamingService, DraftMessageHandler } from '../streaming/index.js';
 import { ThreadManager, TopicHandler } from '../threaded/index.js';
 import { CommandRegistrationService } from './commands/index.js';
+import { HistoricalRunImporter, ReportGenerator, RunTracker } from '../reporting/index.js';
+import type { RunRecord, RunContext } from '../reporting/index.js';
 
 type TextContext = Context<Update.MessageUpdate<Message.TextMessage>>;
 type CallbackContext = Context<Update.CallbackQueryUpdate>;
@@ -38,6 +42,7 @@ const BOT_COMMANDS = new Set([
   'start', 'help', 'new', 'cd', 'list', 'switch', 'close', 'status', 'abort', 'kill', 'sessions', 'attach',
   'voice', 'notify', 'verbosity', 'upload', 'file', 'diff', 'escape',
   'log', 'pwd', 'git', 'tree', 'bookmark', 'context', 'cost',
+  'report', 'reporthistory',
   'babysit', // Alias for /babysitter:call
   'streaming', 'threads', 'topic', 'threadsession', 'threadsessions', 'linksession', 'unlinksession' // Streaming and threaded mode commands
 ]);
@@ -86,6 +91,9 @@ export class TelegramBot {
   private userNotificationPrefs: Map<number, NotificationPreferences> = new Map(); // userId -> notification prefs
   private defaultVerbosity: VerbosityLevel;
   private defaultNotificationPrefs: NotificationPreferences;
+  private reportingConfig: ReportingConfig;
+  private runTracker: RunTracker;
+  private historicalRunImporter: HistoricalRunImporter;
 
   // Output history for /log command
   private outputHistory: string[] = [];
@@ -157,6 +165,22 @@ export class TelegramBot {
       supportedMimeTypes: [],
       allowedExtensions: [],
     };
+    this.reportingConfig = extConfig.reportingConfig || {
+      enabled: true,
+      autoSend: true,
+      babysitterOnly: true,
+      maxRunsPerSession: 25,
+      maxOutputChars: 12000,
+      maxEvents: 200,
+      maxToolInputChars: 2000,
+      maxFileSizeMB: 45,
+      previewDir: undefined,
+    };
+    this.runTracker = new RunTracker(this.reportingConfig);
+    this.historicalRunImporter = new HistoricalRunImporter(this.reportingConfig);
+    if (this.reportingConfig.enabled) {
+      this.outputParser.setStreamingEnabled(true);
+    }
     this.defaultVerbosity = extConfig.verbosityConfig?.defaultLevel || 'normal';
     this.defaultNotificationPrefs = extConfig.notificationConfig?.defaults || DEFAULT_NOTIFICATION_PREFS;
 
@@ -215,6 +239,18 @@ export class TelegramBot {
     this.setupCallbackHandlers();
     this.setupMessageHandlers();
     this.setupOutputForwarding();
+
+    if (this.reportingConfig.enabled) {
+      this.runTracker.on('run_complete', (run) => {
+        const shouldSend = this.reportingConfig.autoSend &&
+          (!this.reportingConfig.babysitterOnly || run.runType === 'babysitter');
+        if (shouldSend) {
+          this.sendRunReport(run).catch((error) => {
+            console.error('[Report] Failed to auto-send run report:', error);
+          });
+        }
+      });
+    }
   }
 
   /**
@@ -317,7 +353,9 @@ export class TelegramBot {
           '/log - Output history\n' +
           '/bookmark - Save/recall prompts\n' +
           '/context - Context usage\n' +
-          '/cost - Session costs\n\n' +
+          '/cost - Session costs\n' +
+          '/report - Latest run report\n' +
+          '/reporthistory - Report from already-completed runs\n\n' +
           'Send any text to interact with the active Claude session.\n\n' +
           '═══════════════════════════════\n' +
           '🧙 100% Built using Babysitter\n' +
@@ -355,7 +393,9 @@ export class TelegramBot {
           '/log [n] - View recent output history\n' +
           '/bookmark - Save and recall prompts\n' +
           '/context - Show context usage\n' +
-          '/cost - Get session cost information\n\n' +
+          '/cost - Get session cost information\n' +
+          '/report [runId] - Get latest run report\n' +
+          '/reporthistory [project] [--index N] - Report from completed runs\n\n' +
           'Features:\n' +
           '/voice [on|off] - Toggle voice transcription\n' +
           '/upload [on|off] - Toggle file upload\n' +
@@ -1544,6 +1584,8 @@ export class TelegramBot {
         }
 
         try {
+          const runContext = this.buildRunContext(sessionId, chatId, messageThreadId, userId);
+          this.trackOutgoingRun(sessionId, savedPrompt, runContext);
           this.sessionManager.sendToSession(sessionId, savedPrompt);
           await this.replyWithThreadSupport(ctx, `📤 Sent bookmark "${subcommand}" to Claude.`, messageThreadId);
         } catch (error) {
@@ -1614,6 +1656,8 @@ export class TelegramBot {
         };
 
         // Send /cost to Claude (use resolved session)
+        const runContext = this.buildRunContext(sessionId, chatId, messageThreadId, ctx.from?.id);
+        this.trackOutgoingRun(sessionId, '/cost', runContext);
         this.sessionManager.sendToSession(sessionId, '/cost');
 
         // Timeout after 10 seconds
@@ -1626,6 +1670,124 @@ export class TelegramBot {
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Failed to get cost info';
         await ctx.reply(`Error: ${message}`);
+      }
+    });
+
+    // /report - Send latest run report as HTML
+    this.bot.command('report', async (ctx) => {
+      if (!this.reportingConfig.enabled) {
+        await ctx.reply('Run reporting is disabled.');
+        return;
+      }
+
+      const chatId = ctx.chat.id;
+      const messageThreadId = this.extractThreadId(ctx.message);
+      const userId = ctx.from?.id;
+
+      const args = this.parseCommandArgs(ctx.message.text, 'report');
+      const runIdArg = args[0];
+
+      let run: RunRecord | null = null;
+
+      if (runIdArg) {
+        run = this.runTracker.findRunById(runIdArg);
+      } else {
+        const { sessionId } = this.resolveSessionForThread(chatId, messageThreadId);
+        if (sessionId) {
+          run = this.runTracker.getLatestRun(sessionId);
+          if (run && !run.context) {
+            run.context = this.buildRunContext(sessionId, chatId, messageThreadId, userId);
+          }
+        }
+      }
+
+      if (!run) {
+        await this.replyWithThreadSupport(ctx, 'No run report found for this session.', messageThreadId);
+        return;
+      }
+
+      if (!run.context) {
+        run.context = this.buildRunContext(run.sessionId, chatId, messageThreadId, userId);
+      }
+
+      await this.sendRunReport(run);
+    });
+
+    // /reporthistory - Generate a report for already completed historical runs
+    this.bot.command('reporthistory', async (ctx) => {
+      if (!this.reportingConfig.enabled) {
+        await ctx.reply('Run reporting is disabled.');
+        return;
+      }
+
+      const chatId = ctx.chat.id;
+      const messageThreadId = this.extractThreadId(ctx.message);
+      const userId = ctx.from?.id;
+
+      const args = this.parseCommandArgs(ctx.message.text, 'reporthistory');
+      const parsed = this.parseReportHistoryArgs(args);
+      if (parsed.error) {
+        await this.replyWithThreadSupport(ctx, parsed.error, messageThreadId);
+        return;
+      }
+
+      let projectPath = parsed.projectPath;
+      if (!projectPath) {
+        const { sessionId } = this.resolveSessionForThread(chatId, messageThreadId);
+        if (sessionId) {
+          const session = this.sessionManager.getSession(sessionId);
+          projectPath = session?.workingDir;
+        }
+      }
+
+      if (!projectPath) {
+        await this.replyWithThreadSupport(
+          ctx,
+          'Usage: /reporthistory <projectPath> [--index N] [--session SESSION_ID_PREFIX] [--all]',
+          messageThreadId
+        );
+        return;
+      }
+
+      try {
+        const selection = await this.historicalRunImporter.findRun({
+          projectPath,
+          runIndex: parsed.runIndex,
+          sessionIdPrefix: parsed.sessionIdPrefix,
+          includeGeneral: parsed.includeGeneral,
+        });
+
+        if (!selection) {
+          await this.replyWithThreadSupport(
+            ctx,
+            `No historical ${parsed.includeGeneral ? '' : 'babysitter '}runs found for ${projectPath}.`,
+            messageThreadId
+          );
+          return;
+        }
+
+        const baseContext = selection.run.context ?? {};
+        const liveContext = this.buildRunContext(selection.run.sessionId, chatId, messageThreadId, userId);
+        selection.run.context = {
+          ...baseContext,
+          chatId: liveContext.chatId ?? baseContext.chatId,
+          threadId: liveContext.threadId ?? baseContext.threadId,
+          userId: liveContext.userId ?? baseContext.userId,
+          sessionName: baseContext.sessionName ?? liveContext.sessionName ?? selection.sessionId,
+          workingDir: baseContext.workingDir ?? liveContext.workingDir ?? projectPath,
+        };
+
+        await this.sendRunReport(selection.run);
+
+        const started = new Date(selection.run.startedAt).toISOString();
+        await this.replyWithThreadSupport(
+          ctx,
+          `Historical run ${selection.runIndex}/${selection.totalRuns} from session ${selection.sessionId.slice(0, 8)} at ${started}.`,
+          messageThreadId
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Failed to generate historical report';
+        await this.replyWithThreadSupport(ctx, `Error: ${message}`, messageThreadId);
       }
     });
 
@@ -1650,6 +1812,8 @@ export class TelegramBot {
 
         // Forward to Claude as /babysitter:call with the same arguments
         const fullCommand = args ? `/babysitter:call ${args}` : '/babysitter:call';
+        const runContext = this.buildRunContext(sessionId, chatId, messageThreadId, ctx.from?.id);
+        this.trackOutgoingRun(sessionId, fullCommand, runContext);
         this.sessionManager.sendToSession(sessionId, fullCommand);
 
         await this.replyWithThreadSupport(ctx, 'Sent to the Babysitter.', messageThreadId);
@@ -2273,6 +2437,7 @@ export class TelegramBot {
           // User selected a numbered option
           const optionIndex = parseInt(selection, 10);
           const pending = this.pendingQuestions.get(chatId);
+          const messageThreadId = (ctx.callbackQuery as { message?: { message_thread_id?: number } }).message?.message_thread_id;
 
           if (pending && pending.question.options[optionIndex]) {
             const selectedOption = pending.question.options[optionIndex];
@@ -2296,6 +2461,8 @@ export class TelegramBot {
 
             // Send the answer as a new message to Claude using the STORED session (the one that asked)
             console.log(`[Answer] Sending answer to ORIGINAL session: "${selectedOption.label}" (session: ${sessionId.substring(0, 8)}...)`);
+            const runContext = this.buildRunContext(sessionId, chatId, messageThreadId, ctx.from?.id);
+            this.trackOutgoingRun(sessionId, selectedOption.label, runContext, true);
             this.sessionManager.sendToSession(sessionId, selectedOption.label);
 
             await ctx.answerCbQuery(`Selected: ${selectedOption.label}`);
@@ -2440,6 +2607,8 @@ export class TelegramBot {
               // Resume normal message forwarding for this session (per-session tracking)
               this.waitingForUserResponse.set(storedSessionId, false);
               console.log(`[CustomAnswer] User responded for ORIGINAL session ${storedSessionId.substring(0, 8)}..., resuming message forwarding`);
+              const runContext = this.buildRunContext(storedSessionId, chatId, incomingThreadId, userId);
+              this.trackOutgoingRun(storedSessionId, text, runContext, true);
               this.sessionManager.sendToSession(storedSessionId, text);
             } else {
               await this.replyWithThreadSupport(ctx,
@@ -2460,6 +2629,8 @@ export class TelegramBot {
                 this.waitingForUserResponse.set(boundSessionId, false);
                 console.log(`[CustomAnswer] User responded for session ${boundSessionId.substring(0, 8)}..., resuming message forwarding`);
                 console.log(`[CustomAnswer] Thread ${incomingThreadId} -> Session ${boundSessionId.substring(0, 8)}...`);
+                const runContext = this.buildRunContext(boundSessionId, chatId, incomingThreadId, userId);
+                this.trackOutgoingRun(boundSessionId, text, runContext, true);
                 this.sessionManager.sendToSession(boundSessionId, text);
               } else {
                 this.threadManager.clearSessionForThread(chatId, incomingThreadId);
@@ -2479,6 +2650,8 @@ export class TelegramBot {
                 this.subscribeToSessionOutput(newSession.id);
                 this.threadManager.setSessionForThread(chatId, incomingThreadId, newSession.id);
                 console.log(`[CustomAnswer] Auto-created session ${newSession.id.substring(0, 8)}... for thread ${incomingThreadId}`);
+                const runContext = this.buildRunContext(newSession.id, chatId, incomingThreadId, userId);
+                this.trackOutgoingRun(newSession.id, text, runContext, true);
                 this.sessionManager.sendToSession(newSession.id, text);
               } catch (error) {
                 const errorMsg = error instanceof Error ? error.message : 'Unknown error';
@@ -2492,6 +2665,8 @@ export class TelegramBot {
             if (activeSession) {
               this.waitingForUserResponse.set(activeSession.id, false);
               console.log(`[CustomAnswer] User responded for active session ${activeSession.id.substring(0, 8)}..., resuming message forwarding`);
+              const runContext = this.buildRunContext(activeSession.id, chatId, incomingThreadId, userId);
+              this.trackOutgoingRun(activeSession.id, text, runContext, true);
             }
             this.sessionManager.sendToActiveSession(text);
           }
@@ -2554,6 +2729,8 @@ export class TelegramBot {
                 this.pendingQuestions.delete(chatId);
               }
               console.log(`[Message] Thread ${incomingThreadId} -> Session ${boundSessionId.substring(0, 8)}...`);
+              const runContext = this.buildRunContext(boundSessionId, chatId, incomingThreadId, userId);
+              this.trackOutgoingRun(boundSessionId, text, runContext);
               this.sessionManager.sendToSession(boundSessionId, text);
             } else {
               // Session was deleted but mapping remains - clean up
@@ -2581,6 +2758,8 @@ export class TelegramBot {
               console.log(`[Message] Auto-created session ${newSession.id.substring(0, 8)}... and bound to thread ${incomingThreadId}`);
 
               // Send the message to the new session
+              const runContext = this.buildRunContext(newSession.id, chatId, incomingThreadId, userId);
+              this.trackOutgoingRun(newSession.id, text, runContext);
               this.sessionManager.sendToSession(newSession.id, text);
 
               // Notify the user
@@ -2604,6 +2783,11 @@ export class TelegramBot {
           }
         } else {
           // Fall back to global session behavior
+          const activeSession = this.sessionManager.getActiveSession();
+          if (activeSession) {
+            const runContext = this.buildRunContext(activeSession.id, chatId, incomingThreadId, userId);
+            this.trackOutgoingRun(activeSession.id, text, runContext);
+          }
           this.sessionManager.sendToActiveSession(text);
         }
 
@@ -2670,6 +2854,8 @@ export class TelegramBot {
         }
 
         // Send to Claude session
+        const runContext = this.buildRunContext(sessionId, chatId, messageThreadId, userId);
+        this.trackOutgoingRun(sessionId, transcribedText, runContext);
         this.sessionManager.sendToSession(sessionId, transcribedText);
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Transcription failed';
@@ -2747,6 +2933,8 @@ export class TelegramBot {
         }
 
         await this.replyWithThreadSupport(ctx, `Sending to Claude: ${fileName}`, messageThreadId);
+        const runContext = this.buildRunContext(sessionId, chatId, messageThreadId, userId);
+        this.trackOutgoingRun(sessionId, messageToSend, runContext);
         this.sessionManager.sendToSession(sessionId, messageToSend);
 
         // Clean up the file after a delay
@@ -2814,6 +3002,8 @@ export class TelegramBot {
         }
 
         await this.replyWithThreadSupport(ctx, 'Sending image to Claude...', messageThreadId);
+        const runContext = this.buildRunContext(sessionId, chatId, messageThreadId, userId);
+        this.trackOutgoingRun(sessionId, messageToSend, runContext);
         this.sessionManager.sendToSession(sessionId, messageToSend);
 
         // Clean up the file after a delay
@@ -2831,6 +3021,35 @@ export class TelegramBot {
    * Set up output forwarding from Claude sessions
    */
   private setupOutputForwarding(): void {
+    // Capture raw output events for run tracking
+    this.outputParser.on('output', (output) => {
+      const sessionId = this.currentOutputSessionId;
+      if (sessionId && this.reportingConfig.enabled) {
+        this.runTracker.recordOutput(sessionId, output);
+      }
+    });
+
+    this.outputParser.on('streaming_start', () => {
+      const sessionId = this.currentOutputSessionId;
+      if (sessionId && this.reportingConfig.enabled) {
+        this.runTracker.recordEvent(sessionId, 'stream_start');
+      }
+    });
+
+    this.outputParser.on('streaming_complete', (event) => {
+      const sessionId = this.currentOutputSessionId;
+      if (sessionId && this.reportingConfig.enabled) {
+        this.runTracker.recordEvent(sessionId, 'stream_complete', `${event.durationMs}ms`);
+      }
+    });
+
+    this.outputParser.on('tool_call', (tool) => {
+      const sessionId = this.currentOutputSessionId;
+      if (sessionId && this.reportingConfig.enabled) {
+        this.runTracker.recordToolCall(sessionId, tool);
+      }
+    });
+
     // Listen for questions from OutputParser
     this.outputParser.on('question', (question: ParsedQuestion) => {
       const sessionId = this.currentOutputSessionId;
@@ -2839,6 +3058,9 @@ export class TelegramBot {
       if (sessionId) {
         this.waitingForUserResponse.set(sessionId, true);
         this.suppressedMessages.set(sessionId, []); // Clear any previously suppressed messages
+        if (this.reportingConfig.enabled) {
+          this.runTracker.recordEvent(sessionId, 'question', question.question);
+        }
       }
       this.forwardQuestionToUsers(question);
     });
@@ -2846,6 +3068,9 @@ export class TelegramBot {
     // Listen for text output (accumulated from streaming deltas)
     this.outputParser.on('text', (text: string) => {
       const sessionId = this.currentOutputSessionId;
+      if (sessionId && this.reportingConfig.enabled) {
+        this.runTracker.recordText(sessionId, text);
+      }
       // Skip if waiting for user to respond to a question (per-session check)
       if (sessionId && this.waitingForUserResponse.get(sessionId)) {
         console.log(`[OutputParser] Suppressing text for session ${sessionId.substring(0, 8)}... while waiting for user response`);
@@ -2971,6 +3196,212 @@ export class TelegramBot {
         percentage: contextMatch[2] ? parseFloat(contextMatch[2]) : undefined,
         timestamp: new Date(),
       };
+    }
+  }
+
+  private buildRunContext(sessionId: string, chatId?: number, threadId?: number, userId?: number): RunContext {
+    const session = this.sessionManager.getSession(sessionId);
+    return {
+      chatId,
+      threadId,
+      userId,
+      sessionName: session?.name,
+      workingDir: session?.workingDir,
+    };
+  }
+
+  private resolveRunType(input: string): 'babysitter' | 'general' {
+    const normalized = input.trim().toLowerCase();
+    if (normalized.startsWith('/babysitter:call') || normalized.startsWith('/babysit')) {
+      return 'babysitter';
+    }
+    return 'general';
+  }
+
+  private parseCommandArgs(text: string, command: string): string[] {
+    const pattern = new RegExp(`^\\/${command}(?:@\\w+)?\\s*`, 'i');
+    const rawArgs = text.replace(pattern, '').trim();
+    if (!rawArgs) return [];
+
+    const tokens = rawArgs.match(/"([^"\\]|\\.)*"|'([^'\\]|\\.)*'|\\S+/g) ?? [];
+    return tokens.map((token) => {
+      if (
+        (token.startsWith('"') && token.endsWith('"')) ||
+        (token.startsWith("'") && token.endsWith("'"))
+      ) {
+        return token.slice(1, -1).replace(/\\(["'\\])/g, '$1');
+      }
+      return token;
+    });
+  }
+
+  private parseReportHistoryArgs(args: string[]): {
+    projectPath?: string;
+    runIndex: number;
+    sessionIdPrefix?: string;
+    includeGeneral: boolean;
+    error?: string;
+  } {
+    let projectPath: string | undefined;
+    let runIndex = 1;
+    let sessionIdPrefix: string | undefined;
+    let includeGeneral = false;
+
+    const positionals: string[] = [];
+
+    for (let i = 0; i < args.length; i += 1) {
+      const arg = args[i];
+      if (arg === '--all') {
+        includeGeneral = true;
+        continue;
+      }
+
+      if (arg === '--index') {
+        const value = args[i + 1];
+        if (!value) {
+          return { runIndex, includeGeneral, error: 'Missing value for --index.' };
+        }
+        const parsed = parseInt(value, 10);
+        if (Number.isNaN(parsed) || parsed < 1) {
+          return { runIndex, includeGeneral, error: '--index must be a positive number.' };
+        }
+        runIndex = parsed;
+        i += 1;
+        continue;
+      }
+
+      if (arg.startsWith('--index=')) {
+        const parsed = parseInt(arg.slice('--index='.length), 10);
+        if (Number.isNaN(parsed) || parsed < 1) {
+          return { runIndex, includeGeneral, error: '--index must be a positive number.' };
+        }
+        runIndex = parsed;
+        continue;
+      }
+
+      if (arg === '--session') {
+        const value = args[i + 1];
+        if (!value) {
+          return { runIndex, includeGeneral, error: 'Missing value for --session.' };
+        }
+        sessionIdPrefix = value;
+        i += 1;
+        continue;
+      }
+
+      if (arg.startsWith('--session=')) {
+        sessionIdPrefix = arg.slice('--session='.length);
+        continue;
+      }
+
+      positionals.push(arg);
+    }
+
+    if (positionals[0]) {
+      projectPath = positionals[0];
+    }
+
+    if (positionals[1]) {
+      const maybeIndex = parseInt(positionals[1], 10);
+      if (!Number.isNaN(maybeIndex) && maybeIndex > 0) {
+        runIndex = maybeIndex;
+      } else if (!sessionIdPrefix) {
+        sessionIdPrefix = positionals[1];
+      }
+    }
+
+    if (positionals[2] && !sessionIdPrefix) {
+      sessionIdPrefix = positionals[2];
+    }
+
+    return {
+      projectPath,
+      runIndex,
+      sessionIdPrefix,
+      includeGeneral,
+    };
+  }
+
+  private trackOutgoingRun(sessionId: string, input: string, context: RunContext, isFollowup: boolean = false): void {
+    if (!this.reportingConfig.enabled) return;
+    if (isFollowup) {
+      this.runTracker.appendUserMessage(sessionId, input, context);
+    } else {
+      this.runTracker.startTypedRun(sessionId, input, this.resolveRunType(input), context);
+    }
+  }
+
+  private async sendRunReport(run: RunRecord): Promise<void> {
+    const chatId = run.context?.chatId ?? this.activeChat ?? Array.from(this.userChatIds.values())[0];
+    if (!chatId) {
+      console.warn('[Report] No chat available to send run report');
+      return;
+    }
+
+    const threadId = run.context?.threadId;
+    let html = ReportGenerator.generateHtml(run, { maxOutputChars: this.reportingConfig.maxOutputChars });
+    let bytes = Buffer.byteLength(html, 'utf8');
+    const maxBytes = this.reportingConfig.maxFileSizeMB * 1024 * 1024;
+
+    if (bytes > maxBytes) {
+      html = ReportGenerator.generateHtml(run, { maxOutputChars: Math.min(2000, this.reportingConfig.maxOutputChars) });
+      bytes = Buffer.byteLength(html, 'utf8');
+    }
+
+    if (this.reportingConfig.previewDir) {
+      await this.saveRunReportPreview(run.id, html);
+    }
+
+    if (bytes > maxBytes) {
+      await this.bot.telegram.sendMessage(
+        chatId,
+        `Run report ${run.id} is too large to send (${(bytes / (1024 * 1024)).toFixed(1)}MB).`,
+        threadId ? { message_thread_id: threadId } : undefined
+      );
+      return;
+    }
+
+    const fileName = `run-${run.id}.html`;
+    const filePath = path.join(os.tmpdir(), fileName);
+    await fs.promises.writeFile(filePath, html, 'utf8');
+
+    try {
+      try {
+        await this.bot.telegram.sendDocument(
+          chatId,
+          { source: fs.createReadStream(filePath), filename: fileName },
+          threadId ? { message_thread_id: threadId, caption: `Run report ${run.id}` } : { caption: `Run report ${run.id}` }
+        );
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        const isThreadError = errorMessage.toLowerCase().includes('thread') ||
+          errorMessage.toLowerCase().includes('topic') ||
+          errorMessage.includes('MESSAGE_THREAD_INVALID');
+        if (threadId && isThreadError) {
+          await this.bot.telegram.sendDocument(
+            chatId,
+            { source: fs.createReadStream(filePath), filename: fileName },
+            { caption: `Run report ${run.id}` }
+          );
+        } else {
+          throw error;
+        }
+      }
+    } finally {
+      fs.promises.unlink(filePath).catch(() => {});
+    }
+  }
+
+  private async saveRunReportPreview(runId: string, html: string): Promise<void> {
+    if (!this.reportingConfig.previewDir) return;
+    const dir = path.resolve(this.reportingConfig.previewDir);
+    const filePath = path.join(dir, `run-${runId}.html`);
+    try {
+      await fs.promises.mkdir(dir, { recursive: true });
+      await fs.promises.writeFile(filePath, html, 'utf8');
+      console.log(`[Report] Saved local preview: ${filePath}`);
+    } catch (error) {
+      console.error('[Report] Failed to save local preview file:', error);
     }
   }
 

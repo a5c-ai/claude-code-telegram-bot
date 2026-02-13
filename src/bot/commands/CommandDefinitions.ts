@@ -185,6 +185,18 @@ export const COMMAND_DEFINITIONS: BotCommandDefinition[] = [
     scopes: [CommandScope.ChatWithSession],
   },
   {
+    command: 'report',
+    description: 'Get latest run report',
+    category: CommandCategory.Utility,
+    scopes: [CommandScope.ChatWithSession],
+  },
+  {
+    command: 'reporthistory',
+    description: 'Get report from completed historical runs',
+    category: CommandCategory.Utility,
+    scopes: [CommandScope.PrivateChats, CommandScope.ChatWithSession],
+  },
+  {
     command: 'bookmark',
     description: 'Save or recall prompts',
     category: CommandCategory.Utility,

@@ -285,6 +285,21 @@ export interface FileUploadConfig {
 }
 
 /**
+ * Run reporting configuration
+ */
+export interface ReportingConfig {
+  enabled: boolean;
+  autoSend: boolean;
+  babysitterOnly: boolean;
+  maxRunsPerSession: number;
+  maxOutputChars: number;
+  maxEvents: number;
+  maxToolInputChars: number;
+  maxFileSizeMB: number;
+  previewDir?: string;
+}
+
+/**
  * Extended TelegramBot configuration with new features
  */
 export interface ExtendedTelegramBotConfig extends TelegramBotConfig {
@@ -292,6 +307,7 @@ export interface ExtendedTelegramBotConfig extends TelegramBotConfig {
   notificationConfig?: NotificationConfig;
   verbosityConfig?: VerbosityConfig;
   fileUploadConfig?: FileUploadConfig;
+  reportingConfig?: ReportingConfig;
   logLevel?: LogLevel;
 }
 

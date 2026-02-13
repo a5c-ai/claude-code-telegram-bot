@@ -15,6 +15,11 @@
     "sourceMap": true,
     "resolveJsonModule": true
   },
+  "ts-node": {
+    "esm": true,
+    "experimentalResolver": true,
+    "experimentalSpecifierResolution": "node"
+  },
   "include": ["src/**/*"],
   "exclude": ["node_modules", "dist", "tests"]
 }
